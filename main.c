@@ -290,7 +290,7 @@ void print_ul(unsigned long num)
     unsigned long div;
     char dg, dz = 0;
 
-    div = 1000000000u;
+    div = 1000000000ul;
     while ( div ) {
         dg = (num / div) % 10;        
         if ( dz == 0 ) {
@@ -375,7 +375,7 @@ PT_THREAD(main_thread(struct pt *pt))
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
     {
         uptime = eeprom_read_dword(EEPROM_LONG_UPTIME);
-        if ( uptime == 0xFFFFFFFFu ) {
+        if ( uptime == 0xFFFFFFFFul ) {
             uptime = 0;
         }
     }

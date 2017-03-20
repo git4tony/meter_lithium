@@ -1,7 +1,10 @@
 #include <inttypes.h>
+
+#include <avr/eeprom.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
+
 #include <util/delay.h>
 #include <util/atomic.h>
 
@@ -53,12 +56,19 @@
 #define CHAR_u 0x1c
 #define CHAR_BAR 0x40
 
+#define EEPROM_WORD_BOOT_COUNT  (uint16_t *)2
+#define EEPROM_LONG_UPTIME      (uint32_t *)4
+#define EEPROM_BYTE_NEXT        (uint8_t *)8
+
 struct timer { int start, interval; };
+
 int  timer_expired(struct timer *t);
 void timer_set(struct timer *t, int interval);
 int tick_time(void);
 
 unsigned long uptime_get(void);
+unsigned short adc_read(unsigned mux);
+long map(long x, long in_min, long in_max, long out_min, long out_max);
 
 unsigned char hex_tab[16] = {
    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f,
@@ -66,7 +76,7 @@ unsigned char hex_tab[16] = {
 };
 
 volatile unsigned short tick1ms = 0;
-volatile unsigned long uptime = 4294967290;
+volatile unsigned long uptime = 0;
 
 #if 0
 enum { UP, DOWN };
@@ -348,17 +358,69 @@ PT_THREAD(scan_thread(struct pt *pt))
 
 PT_THREAD(main_thread(struct pt *pt))
 {
+    static unsigned long last_uptime;
     static struct timer t;
 
     PT_BEGIN(pt);
     
     PT_WAIT_WHILE(pt, is_timer2_busy());
 
+    uint16_t tmp;
+
+    tmp = eeprom_read_word(EEPROM_WORD_BOOT_COUNT);
+    tmp++;
+    eeprom_busy_wait();
+    eeprom_write_word(EEPROM_WORD_BOOT_COUNT, tmp);
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+    {
+        uptime = eeprom_read_dword(EEPROM_LONG_UPTIME);
+        if ( uptime == 0xFFFFFFFFu ) {
+            uptime = 0;
+        }
+    }
+    last_uptime = uptime_get();
+
     for (;;) {
+        uint16_t raw;
+        uint16_t volt;
+        uint8_t percent;
+        
+        if ( last_uptime != uptime_get() ) {
+            eeprom_busy_wait();
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+            {
+                eeprom_write_dword(EEPROM_LONG_UPTIME, uptime);
+            }
+        }
+
         timer_set(&t, 1000);
         printf("main_thread() %u ", tick_time());
         print_ul(uptime_get());
-        printf("\n");
+
+        raw = adc_read(0);
+        volt = map(raw, 0, 1024, 0, 5000);        
+
+        //Method 1) read directed
+        //32.0V --> 2.667V 0%
+        //48.0V --> 4.000V
+        //58.4V --> 4.867V 100%
+        //60.0V --> 5.000V
+        //percent = map(volt, 2667, 4867, 0, 100);
+
+        //Method 2) read output opamp
+        //32.0V --> 0.000V 0%
+        //58.4V --> 4.8867V 100%
+        percent = map(volt, 0, 4867, 0, 100);
+
+        printf(", %04x", raw); 
+        printf(" %u", volt);
+        printf(" %u", percent);
+
+        raw = adc_read(0xe); //V(bg) ~1.30V
+        volt = map(raw, 0, 1024, 0, 5000);
+        printf(", %04x", raw); 
+        printf(" %u\n", volt);
 
         PT_WAIT_UNTIL(pt, timer_expired(&t));
 
@@ -399,6 +461,37 @@ void timer_set(struct timer *t, int interval)
     t->interval = interval; t->start = tick_time(); 
 }
 
+unsigned short adc_read(unsigned mux)
+{
+   unsigned short raw;
+   
+   ADCSRA  =  0;  // Turn off the ADC
+   
+   //ADMUX   =  ((1 << REFS1) | (1 << REFS0)) + mux; // Internal 2.56V
+   ADMUX   =  ((0 << REFS1) | (1 << REFS0)) + mux; // AVCC
+   ADCSRA  =  (1 << ADEN)  | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+
+   ADCSRA |= (1 << ADSC); // Start Conversion
+
+   while ( ADCSRA & (1 << ADSC) )
+      ;
+
+   while ( !(ADCSRA & (1 << ADIF)) )
+      ;
+
+   raw  =  ADCL;
+   raw += (ADCH << 8);
+
+   ADCSRA = 0;    // turn off the ADC
+   raw &= 0x03FF; // 10 bits
+   
+   return raw;
+}
+
+long map(long x, long in_min, long in_max, long out_min, long out_max)
+{
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
 
 int main (void)
 {
@@ -412,6 +505,15 @@ int main (void)
     sei();
 
     printf("TCNT1 %u\n", TCNT1);
+
+    printf("EEPROM 0 %02x\n", eeprom_read_byte((const uint8_t *)0));
+    printf("EEPROM 1 %02x\n", eeprom_read_byte((const uint8_t *)1));
+    printf("EEPROM 2 %02x\n", eeprom_read_byte((const uint8_t *)2));
+    printf("EEPROM 3 %02x\n", eeprom_read_byte((const uint8_t *)3));
+    printf("EEPROM 4 %02x\n", eeprom_read_byte((const uint8_t *)4));
+    printf("EEPROM 5 %02x\n", eeprom_read_byte((const uint8_t *)5));
+    printf("EEPROM 6 %02x\n", eeprom_read_byte((const uint8_t *)6));
+    printf("EEPROM 7 %02x\n", eeprom_read_byte((const uint8_t *)7));
 
     //OE
     PORTD &= ~(1<<PD4);

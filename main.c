@@ -13,6 +13,15 @@
 #include "printf.h"
 #include "pt.h"
 
+#define DBG_BIT_DEF     PD6
+#define DBG_DDR_DEF     DDRD
+#define DBG_PORT_DEF    PORTD
+
+#define DBG_BIT_OUT     DBG_DDR_DEF |= (1<<DBG_BIT_DEF)
+#define DBG_BIT_0       DBG_PORT_DEF &= ~(1<<DBG_BIT_DEF)
+#define DBG_BIT_1       DBG_PORT_DEF |= (1<<DBG_BIT_DEF)
+#define DBG_BIT_TOGGLE  DBG_PORT_DEF ^= (1<<DBG_BIT_DEF)
+
 /*
      a
     ---
@@ -64,10 +73,15 @@ struct timer { int start, interval; };
 
 int  timer_expired(struct timer *t);
 void timer_set(struct timer *t, int interval);
-int tick_time(void);
+int tick_get(void);
 
 unsigned long uptime_get(void);
-unsigned short adc_read(unsigned mux);
+//unsigned short adc_read(unsigned char mux);
+void adc_start(unsigned char mux);
+unsigned char adc_is_started(void);
+unsigned char adc_is_ready(void);
+unsigned short adc_value(void);
+
 long map(long x, long in_min, long in_max, long out_min, long out_max);
 
 unsigned char hex_tab[16] = {
@@ -77,58 +91,6 @@ unsigned char hex_tab[16] = {
 
 volatile unsigned short tick1ms = 0;
 volatile unsigned long uptime = 0;
-
-#if 0
-enum { UP, DOWN };
-ISR (TIMER1_OVF_vect)
-{
-    static uint16_t pwm;
-    static uint8_t direction;
-
-    switch (direction)
-    {
-        case UP:
-            if (++pwm == TIMER1_TOP)
-                direction = DOWN;
-            break;
-
-        case DOWN:
-            if (--pwm == 0)
-                direction = UP;
-            break;
-    }
-
-    OCR = pwm;
-}
-
-void ioinit (void)
-{
-    /* Timer 1 is 10-bit PWM (8-bit PWM on some ATtinys). */
-    TCCR1A = TIMER1_PWM_INIT;
-    /*
-     * Start timer 1.
-     *
-     * NB: TCCR1A and TCCR1B could actually be the same register, so
-     * take care to not clobber it.
-     */
-    TCCR1B |= TIMER1_CLOCKSOURCE;
-    /*
-     * Run any device-dependent timer 1 setup hook if present.
-     */
-#if defined(TIMER1_SETUP_HOOK)
-    TIMER1_SETUP_HOOK();
-#endif
-
-    /* Set PWM value to 0. */
-    OCR = 0;
-
-    /* Enable OC1 as output. */
-    DDROC = _BV (OC1);
-
-    /* Enable timer 1 overflow interrupt. */
-    TIMSK = _BV (TOIE1);    
-}
-#endif
 
 #define TCNT1_VALUE (65536u - 125)
 
@@ -179,11 +141,9 @@ void timer2_init(void)
 
     TIFR  |= (1<<TOV2);
     TIMSK  |= (1<<TOIE2);
-    
-    DDRD |= (1<<PD6);
 }
 
-unsigned char is_timer2_busy(void)
+unsigned char timer2_is_busy(void)
 {
     return (ASSR & ((1<<TCN2UB) | (1<<TCR2UB)));
 }
@@ -191,9 +151,6 @@ unsigned char is_timer2_busy(void)
 //Overflow ISR
 ISR(TIMER2_OVF_vect)
 {
-    //Toggle pin PD6 every second
-    PORTD ^= (1<<PD6);
-
     uptime++;
 }
 
@@ -309,7 +266,7 @@ void print_ul(unsigned long num)
 #define RCK_0   PORTD &= ~(1<<RCK_BIT)
 #define RCK_1   PORTD |= (1<<RCK_BIT)
 
-void shift(unsigned char *p, unsigned char n)
+static void shift(unsigned char *p, unsigned char n)
 {
     RCK_0;
     while ( n ) {
@@ -323,7 +280,7 @@ void shift(unsigned char *p, unsigned char n)
 unsigned char shift_buf[4];
 unsigned char led_buf[16];
 
-void format_scan(unsigned char *out, unsigned char *in, unsigned char index)
+static void format(unsigned char *out, unsigned char *in, unsigned char index)
 {
     //out column
     out[0] = ~in[index];
@@ -338,6 +295,7 @@ PT_THREAD(scan_thread(struct pt *pt))
 
     //25*8 = 200
     PT_BEGIN(pt);
+
     for (;;) {
         for ( i = 0; i < 8; i++ ) {
             timer_set(&t, 5);
@@ -345,32 +303,70 @@ PT_THREAD(scan_thread(struct pt *pt))
             shift(shift_buf, sizeof(shift_buf));
             _delay_us(10);
 
-            format_scan(&shift_buf[0], &led_buf[0], i);
-            format_scan(&shift_buf[2], &led_buf[8], i);
+            format(&shift_buf[0], &led_buf[0], i);
+            format(&shift_buf[2], &led_buf[8], i);
             shift(shift_buf, sizeof(shift_buf));
 
-            PT_WAIT_UNTIL(pt, timer_expired(&t));            
-        }
-        PT_YIELD(pt);
-    }    
+            PT_YIELD_UNTIL(pt, timer_expired(&t));            
+        }        
+    }
+
     PT_END(pt);
 }
 
-PT_THREAD(main_thread(struct pt *pt))
+PT_THREAD(eeprom_write_thread(struct pt *pt, void *addr, void *buf, uint8_t size))
 {
-    static unsigned long last_uptime;
-    static struct timer t;
+    static uint8_t *a;
+    static uint8_t *p;
+    static uint8_t n;
 
     PT_BEGIN(pt);
     
-    PT_WAIT_WHILE(pt, is_timer2_busy());
+    a = (uint8_t *)addr;
+    p = (uint8_t *)buf;
+    for ( n = 0; n < size; n++ ) {
+        eeprom_write_byte(a++, *p++);    
+        PT_YIELD_UNTIL(pt, eeprom_is_ready());
+    }
 
-    uint16_t tmp;
+    PT_END(pt);
+}
+
+#define PT_EEPROM_WRITE(a, b, c)    PT_SPAWN(pt, &child, eeprom_write_thread(&child, (void *)(a), b, c))
+#define PT_EEPROM_WRITE_BYTE(a, b)  PT_EEPROM_WRITE(a, &b, 1)
+#define PT_EEPROM_WRITE_WORD(a, b)  PT_EEPROM_WRITE(a, &b, 2)
+#define PT_EEPROM_WRITE_DWORD(a, b) PT_EEPROM_WRITE(a, &b, 4)
+
+PT_THREAD(adc_read_thread(struct pt *pt, uint8_t mux, uint16_t *raw))
+{
+    PT_BEGIN(pt);
+
+    adc_start(mux);
+    PT_YIELD_UNTIL(pt, adc_is_started());
+    PT_YIELD_UNTIL(pt, adc_is_ready());
+    *raw = adc_value();
+
+    PT_END(pt);
+}
+
+#define PT_ADC_READ(a, b)   PT_SPAWN(pt, &child, adc_read_thread(&child, a, b))
+
+PT_THREAD(main_thread(struct pt *pt))
+{
+    //static struct timer t;
+    static struct pt child;
+    static unsigned long tmp_uptime;
+    static uint16_t tmp;
+
+    PT_BEGIN(pt);
+    
+    PT_YIELD_UNTIL(pt, !timer2_is_busy());
 
     tmp = eeprom_read_word(EEPROM_WORD_BOOT_COUNT);
     tmp++;
-    eeprom_busy_wait();
-    eeprom_write_word(EEPROM_WORD_BOOT_COUNT, tmp);
+    DBG_BIT_1;
+    PT_EEPROM_WRITE_WORD(EEPROM_WORD_BOOT_COUNT, tmp);
+    DBG_BIT_0;
 
     ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
     {
@@ -379,27 +375,24 @@ PT_THREAD(main_thread(struct pt *pt))
             uptime = 0;
         }
     }
-    last_uptime = uptime_get();
 
+    tmp_uptime = uptime_get();
     for (;;) {
-        uint16_t raw;
-        uint16_t volt;
-        uint8_t percent;
+        static uint16_t raw;
+        static uint16_t volt;
+        static uint8_t percent;
+        static uint16_t xvolt;
         
-        if ( last_uptime != uptime_get() ) {
-            eeprom_busy_wait();
-            ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
-            {
-                eeprom_write_dword(EEPROM_LONG_UPTIME, uptime);
-            }
-        }
-
-        timer_set(&t, 1000);
-        printf("main_thread() %u ", tick_time());
+        printf("main_thread() %u ", tick_get());
         print_ul(uptime_get());
 
-        raw = adc_read(0);
+#if 1
+        DBG_BIT_1;
+        PT_ADC_READ(0, &raw);
+        DBG_BIT_0;
+
         volt = map(raw, 0, 1024, 0, 5000);        
+        xvolt = map(volt, 0, 5000, 0, 600);
 
         //Method 1) read directed
         //32.0V --> 2.667V 0%
@@ -415,21 +408,30 @@ PT_THREAD(main_thread(struct pt *pt))
 
         printf(", %04x", raw); 
         printf(" %u", volt);
-        printf(" %u", percent);
+        printf(" %u%%", percent);        
+        printf(" %u", xvolt);
 
-        raw = adc_read(0xe); //V(bg) ~1.30V
+        DBG_BIT_1;
+        PT_ADC_READ(0xe, &raw); //V(bg) ~1.30V
+        DBG_BIT_0;
+
         volt = map(raw, 0, 1024, 0, 5000);
         printf(", %04x", raw); 
-        printf(" %u\n", volt);
+        printf(" %u", volt);
+#endif
+        printf("\n");
 
-        PT_WAIT_UNTIL(pt, timer_expired(&t));
-
-        PT_YIELD(pt);
+        PT_WAIT_UNTIL(pt, tmp_uptime != uptime_get());
+        tmp_uptime = uptime_get();
+        
+        DBG_BIT_1;
+        PT_EEPROM_WRITE_DWORD(EEPROM_LONG_UPTIME, tmp_uptime);
+        DBG_BIT_0;
     }
     PT_END(pt);
 }
 
-int tick_time(void)
+int tick_get(void)
 {
     int t;
   
@@ -453,15 +455,16 @@ unsigned long uptime_get(void)
 
 int timer_expired(struct timer *t)
 { 
-    return (int)(tick_time() - t->start) >= (int)t->interval; 
+    return (int)(tick_get() - t->start) >= (int)t->interval; 
 }
 
 void timer_set(struct timer *t, int interval)
 {
-    t->interval = interval; t->start = tick_time(); 
+    t->interval = interval; t->start = tick_get(); 
 }
 
-unsigned short adc_read(unsigned mux)
+#if 0
+unsigned short adc_read(unsigned char mux)
 {
    unsigned short raw;
    
@@ -479,6 +482,40 @@ unsigned short adc_read(unsigned mux)
    while ( !(ADCSRA & (1 << ADIF)) )
       ;
 
+   raw  =  ADCL;
+   raw += (ADCH << 8);
+
+   ADCSRA = 0;    // turn off the ADC
+   raw &= 0x03FF; // 10 bits
+   
+   return raw;
+}
+#endif
+
+void adc_start(unsigned char mux)
+{
+   ADCSRA  =  0;  // Turn off the ADC
+   
+   //ADMUX   =  ((1 << REFS1) | (1 << REFS0)) + mux; // Internal 2.56V
+   ADMUX   =  ((0 << REFS1) | (1 << REFS0)) + mux; // AVCC
+   ADCSRA  =  (1 << ADEN)  | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+   ADCSRA |= (1 << ADSC); // Start Conversion    
+}
+
+unsigned char adc_is_started(void)
+{
+    return !(ADCSRA & (1 << ADSC));
+}
+
+unsigned char adc_is_ready(void)
+{
+    return (ADCSRA & (1 << ADIF));
+}
+
+unsigned short adc_value(void)
+{
+   unsigned short raw;
+    
    raw  =  ADCL;
    raw += (ADCH << 8);
 
@@ -514,6 +551,9 @@ int main (void)
     printf("EEPROM 5 %02x\n", eeprom_read_byte((const uint8_t *)5));
     printf("EEPROM 6 %02x\n", eeprom_read_byte((const uint8_t *)6));
     printf("EEPROM 7 %02x\n", eeprom_read_byte((const uint8_t *)7));
+    
+    DBG_BIT_0;
+    DBG_BIT_OUT;
 
     //OE
     PORTD &= ~(1<<PD4);

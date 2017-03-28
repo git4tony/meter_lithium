@@ -82,6 +82,8 @@ unsigned char adc_is_started(void);
 unsigned char adc_is_ready(void);
 unsigned short adc_value(void);
 
+PT_THREAD(scan_thread(struct pt *pt));
+
 long map(long x, long in_min, long in_max, long out_min, long out_max);
 
 unsigned char hex_tab[16] = {
@@ -91,6 +93,15 @@ unsigned char hex_tab[16] = {
 
 volatile unsigned short tick1ms = 0;
 volatile unsigned long uptime = 0;
+
+struct pt scan_pt;
+uint8_t clock_dot = 0;
+uint8_t blink_on = 0;
+
+uint8_t display_mode = 0;
+
+uint8_t test_mode = 0;
+uint8_t test_percent = 0;
 
 #define TCNT1_VALUE (65536u - 125)
 
@@ -122,6 +133,8 @@ ISR(TIMER1_OVF_vect)
     PORTB ^= (1<<PB1);
 
     tick1ms++;
+
+    scan_thread(&scan_pt);
 }
 
 //async mode 32.768 kHz
@@ -268,7 +281,7 @@ void print_ul(unsigned long num)
 
 static void shift(unsigned char *p, unsigned char n)
 {
-    RCK_0;
+    //RCK_0;
     while ( n ) {
         spi_transmit(p[--n]);
     }
@@ -288,26 +301,38 @@ static void format(unsigned char *out, unsigned char *in, unsigned char index)
     out[1] = (1<<index);
 }
 
+static void black(unsigned char *out)
+{
+    //out column
+    out[0] = 0xFF; //was 0
+    //out row
+    out[1] = 0;
+}
+
 PT_THREAD(scan_thread(struct pt *pt))
 {    
     static unsigned char i;
-    static struct timer t;
+    //static struct timer t;
 
     //25*8 = 200
     PT_BEGIN(pt);
 
     for (;;) {
         for ( i = 0; i < 8; i++ ) {
-            timer_set(&t, 5);
-            memset(shift_buf, 0, sizeof(shift_buf));
+            //timer_set(&t, 2);
+            //memset(shift_buf, 0xFF, sizeof(shift_buf));
+            black(&shift_buf[0]);
+            black(&shift_buf[2]);
             shift(shift_buf, sizeof(shift_buf));
-            _delay_us(10);
+            //_delay_us(10);
+            //PT_YIELD(pt);
 
             format(&shift_buf[0], &led_buf[0], i);
             format(&shift_buf[2], &led_buf[8], i);
             shift(shift_buf, sizeof(shift_buf));
-
-            PT_YIELD_UNTIL(pt, timer_expired(&t));            
+            PT_YIELD(pt);
+            PT_YIELD(pt);
+            //PT_YIELD_UNTIL(pt, timer_expired(&t));            
         }        
     }
 
@@ -351,6 +376,111 @@ PT_THREAD(adc_read_thread(struct pt *pt, uint8_t mux, uint16_t *raw))
 
 #define PT_ADC_READ(a, b)   PT_SPAWN(pt, &child, adc_read_thread(&child, a, b))
 
+void put_time(void)
+{
+    uint32_t t;
+    uint8_t hour;
+    uint8_t min;
+    uint8_t sec;
+    uint8_t tmp;
+
+    t = uptime_get();
+
+    hour = (t / 3600);
+    t %= 3600;
+    min = (t / 60);
+    sec = (t % 60);
+
+    printf("%02u:%02u:%02u\n", hour, min, sec);
+
+    tmp = hour;
+    led_buf[8] = hex_tab[(tmp / 10) % 10];
+    led_buf[9] = hex_tab[tmp % 10] | (clock_dot ? 0x80 : 0);
+
+    tmp = min;
+    led_buf[10] = hex_tab[(tmp / 10) % 10];
+    led_buf[11] = hex_tab[tmp % 10];
+    
+}
+
+void put_percent(uint8_t p)
+{
+    uint8_t tmp;
+
+    tmp = p;
+    
+    led_buf[0] = (p >= 100 ? hex_tab[tmp / 100] : 0);
+    tmp %= 100;
+    led_buf[1] = (p >= 10 ? hex_tab[tmp / 10] : 0);
+    tmp %= 10;
+    led_buf[2] = hex_tab[tmp];
+
+    if ( p == 100 ) {
+        blink_on = 0;
+        led_buf[3] = 0x03;
+        led_buf[4] = 0xFF;
+    }
+    else if ( p <= 10 ) {
+        blink_on = 1;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x01;
+    }
+    else if ( p <= 20 ) {
+        blink_on = 1;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x03;
+    }
+    else if ( p <= 30 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x07;
+    }
+    else if ( p <= 40 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x0F;
+    }
+    else if ( p <= 50 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x1F;
+    }
+    else if ( p <= 60 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x3F;
+    }
+    else if ( p <= 70 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0x7F;
+    }
+    else if ( p <= 80 ) {
+        blink_on = 0;
+        led_buf[3] = 0x00;
+        led_buf[4] = 0xFF;
+    }
+    else {
+        blink_on = 0;
+        led_buf[3] = 0x01;
+        led_buf[4] = 0xFF;        
+    }
+    
+}
+
+void put_volt(uint16_t v)
+{
+    uint16_t tmp;
+
+    tmp = v % 1000;
+
+    led_buf[12] = (v >= 100 ? hex_tab[tmp / 100] : 0);
+    tmp %= 100;
+    led_buf[13] = (v >= 10 ? hex_tab[tmp / 10] : 0) | 0x80;
+    tmp %= 10;
+    led_buf[14] = hex_tab[tmp];    
+}
+
 PT_THREAD(main_thread(struct pt *pt))
 {
     //static struct timer t;
@@ -388,7 +518,8 @@ PT_THREAD(main_thread(struct pt *pt))
 
 #if 1
         DBG_BIT_1;
-        PT_ADC_READ(0, &raw);
+        //PT_ADC_READ(0, &raw);
+        PT_ADC_READ(1, &raw);
         DBG_BIT_0;
 
         volt = map(raw, 0, 1024, 0, 5000);        
@@ -399,17 +530,34 @@ PT_THREAD(main_thread(struct pt *pt))
         //48.0V --> 4.000V
         //58.4V --> 4.867V 100%
         //60.0V --> 5.000V
-        //percent = map(volt, 2667, 4867, 0, 100);
+        
+        #define VOLT_BUTTOM 320
+        #define VOLT_TOP    584
+
+        if ( xvolt <= VOLT_BUTTOM )
+            percent = 0;
+        else if ( xvolt >= VOLT_TOP )
+            percent = 100;
+        else
+            percent = map(xvolt, VOLT_BUTTOM, VOLT_TOP, 0, 100);
 
         //Method 2) read output opamp
         //32.0V --> 0.000V 0%
         //58.4V --> 4.8867V 100%
-        percent = map(volt, 0, 4867, 0, 100);
+        //percent = map(volt, 0, 4867, 0, 100);
 
         printf(", %04x", raw); 
         printf(" %u", volt);
         printf(" %u%%", percent);        
         printf(" %u", xvolt);
+
+        if ( test_mode ) {
+            percent = test_percent;
+        }
+
+        put_percent(percent);
+        if ( display_mode == 1 )
+            put_volt(xvolt);
 
         DBG_BIT_1;
         PT_ADC_READ(0xe, &raw); //V(bg) ~1.30V
@@ -418,16 +566,141 @@ PT_THREAD(main_thread(struct pt *pt))
         volt = map(raw, 0, 1024, 0, 5000);
         printf(", %04x", raw); 
         printf(" %u", volt);
+
+        //compute vcc
+        
 #endif
         printf("\n");
 
         PT_WAIT_UNTIL(pt, tmp_uptime != uptime_get());
         tmp_uptime = uptime_get();
+        clock_dot = 1;
         
         DBG_BIT_1;
         PT_EEPROM_WRITE_DWORD(EEPROM_LONG_UPTIME, tmp_uptime);
         DBG_BIT_0;
     }
+    PT_END(pt);
+}
+
+PT_THREAD(time_thread(struct pt *pt))
+{
+    static struct timer t;
+
+    PT_BEGIN(pt);
+
+    for (;;) {
+        PT_YIELD_UNTIL(pt, clock_dot);
+
+        if ( display_mode == 1 )
+            put_time();
+
+        timer_set(&t, 500);
+        PT_YIELD_UNTIL(pt, timer_expired(&t));
+        clock_dot = 0;
+
+        if ( display_mode == 1 )
+            led_buf[9] &= ~0x80;
+
+        if ( blink_on ) {
+            blink_on = 0;
+            led_buf[4] = 0;
+        }
+    }
+
+    PT_END(pt);
+}
+
+PT_THREAD(btn1_thread(struct pt *pt))
+{
+    static struct timer t;
+
+    PT_BEGIN(pt);
+
+    PORTD |= (1<<PD2);
+    DDRD &= ~(1<<PD2);
+
+    timer_set(&t, 100);
+    PT_YIELD_UNTIL(pt, timer_expired(&t));
+    for (;;) {
+        PT_YIELD_UNTIL(pt, !(PIND & (1<<PD2)));
+        timer_set(&t, 10);
+        PT_YIELD_UNTIL(pt, timer_expired(&t));
+        if ( !(PIND & (1<<PD2)) ) {
+            printf("button 1 pressed!\n");
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                uptime = 0;
+            }
+        }
+        else {
+            continue;
+        }
+        PT_YIELD_UNTIL(pt, (PIND & (1<<PD2)));
+        printf("button 1 released!\n");
+        timer_set(&t, 10);
+        PT_YIELD_UNTIL(pt, timer_expired(&t));
+    }
+
+    PT_END(pt);
+}
+
+PT_THREAD(btn2_thread(struct pt *pt))
+{
+    static struct timer t;
+
+    PT_BEGIN(pt);
+
+    PORTD |= (1<<PD3);
+    DDRD &= ~(1<<PD3);
+
+    timer_set(&t, 100);
+    PT_YIELD_UNTIL(pt, timer_expired(&t));
+    for (;;) {
+        PT_YIELD_UNTIL(pt, !(PIND & (1<<PD3)));
+        timer_set(&t, 10);
+        PT_YIELD_UNTIL(pt, timer_expired(&t));
+        if ( !(PIND & (1<<PD3)) ) {
+            printf("button 2 pressed!\n");
+            if ( display_mode == 1 ) {
+                //clear display time
+                led_buf[8] = 0;
+                led_buf[9] = 0;
+                led_buf[10] = 0;
+                led_buf[11] = 0;
+
+                // volt
+                led_buf[12] = 0;
+                led_buf[13] = 0;
+                led_buf[14] = 0;
+
+                display_mode = 0;
+            }
+            else {
+                display_mode = 1;
+            }
+
+#if 0
+            if ( test_mode == 0 )
+                test_mode = 1;
+
+            if ( test_percent < 100 )     
+                test_percent += 10;
+            else {
+                test_percent = 0;
+                test_mode = 0;
+            }
+#endif
+
+        }
+        else {
+            continue;
+        }
+        PT_YIELD_UNTIL(pt, (PIND & (1<<PD3)));
+        printf("button 2 released!\n");
+        timer_set(&t, 10);
+        PT_YIELD_UNTIL(pt, timer_expired(&t));
+    }
+
     PT_END(pt);
 }
 
@@ -532,13 +805,46 @@ long map(long x, long in_min, long in_max, long out_min, long out_max)
 
 int main (void)
 {
-    struct pt main_pt, scan_pt;
+    struct pt main_pt, time_pt, btn1_pt, btn2_pt;
 
     cli();
     timer1_init();
     timer2_init();
     uart_init();
     spi_init();
+
+    //OE
+    PORTD &= ~(1<<PD4);
+    DDRD |= (1<<PD4);
+
+    //RCK
+    PORTD &= ~(1<<PD5);
+    DDRD |= (1<<PD5);
+
+    PT_INIT(&scan_pt);
+
+    //percent
+    led_buf[0] = 0;
+    led_buf[1] = 0;
+    led_buf[2] = hex_tab[0];
+    
+    //bar
+    led_buf[3] = 0x00; //was 0x03;
+    led_buf[4] = 0x00; //was 0xFF;
+
+    if ( display_mode == 1 ) {
+        //hour,min
+        led_buf[8] = hex_tab[0];
+        led_buf[9] = hex_tab[0] | 0x80;
+        led_buf[10] = hex_tab[0];
+        led_buf[11] = hex_tab[0];
+
+        //volt
+        led_buf[12] = 0;
+        led_buf[13] = hex_tab[0] | 0x80;
+        led_buf[14] = hex_tab[0];
+    }
+
     sei();
 
     printf("TCNT1 %u\n", TCNT1);
@@ -554,33 +860,11 @@ int main (void)
     
     DBG_BIT_0;
     DBG_BIT_OUT;
-
-    //OE
-    PORTD &= ~(1<<PD4);
-    DDRD |= (1<<PD4);
-
-    //RCK
-    PORTD &= ~(1<<PD5);
-    DDRD |= (1<<PD5);
-
-    led_buf[0] = hex_tab[0];
-    led_buf[1] = hex_tab[1];
-    led_buf[2] = hex_tab[2];
-    
-    led_buf[3] = 0xFF;
-    led_buf[4] = 0x03;
-
-    led_buf[8] = hex_tab[0];
-    led_buf[9] = hex_tab[1];
-    led_buf[10] = hex_tab[2];
-    led_buf[11] = hex_tab[3];
-
-    led_buf[12] = hex_tab[10];
-    led_buf[13] = hex_tab[11];
-    led_buf[14] = hex_tab[12];
     
     PT_INIT(&main_pt);
-    PT_INIT(&scan_pt);
+    PT_INIT(&time_pt);
+    PT_INIT(&btn1_pt);
+    PT_INIT(&btn2_pt);
     for (;;) {
         //static unsigned int count = 0;
         //sleep_mode();
@@ -594,9 +878,11 @@ int main (void)
 
         //printf("%u\n", tick1ms);
 
-        //_delay_ms(100);
         main_thread(&main_pt);
-        scan_thread(&scan_pt);
+        time_thread(&time_pt);
+        btn1_thread(&btn1_pt);
+        btn2_thread(&btn2_pt);
+
     }
 
     return (0);
